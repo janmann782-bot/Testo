@@ -1,285 +1,158 @@
-from __future__ import annotations
-
+"""One SQLite file: atomic event log, cache and pending orders. No session folders."""
+import io
 import json
-import os
-import shutil
-import tempfile
-from dataclasses import dataclass
-from datetime import date, timedelta
-from pathlib import Path
-
+import sqlite3
+import secrets
+from contextlib import contextmanager
 import numpy as np
-from PIL import Image
+from state import World
+from layers import Layers, read_png
+from engine import simulate, update_contested
+from orders import reference_hash
+import config
 
-from engine import initial_state, load_rgb
-
-SCHEMA_VERSION = 2
-
-
-@dataclass(slots=True)
-class SessionPaths:
-    root: Path
-    base: Path
-    terrain: Path
-    cities: Path
-    homeland: Path
-    initial_control: Path
-    current_control: Path
-    territory: Path
-    meta: Path
-    operations: Path
-    # Legacy v1 paths, retained only for migration.
-    legacy_initial_owner: Path
-    legacy_current_owner: Path
+class MissingSession(ValueError): pass
 
 
-def paths_for(data_dir: Path, chat_id: int) -> SessionPaths:
-    root = data_dir / str(chat_id)
-    return SessionPaths(
-        root=root,
-        base=root / "base.png",
-        terrain=root / "terrain.png",
-        cities=root / "cities.png",
-        homeland=root / "homeland.npy",
-        initial_control=root / "initial_control.npy",
-        current_control=root / "current_control.npy",
-        territory=root / "territory.npy",
-        meta=root / "meta.json",
-        operations=root / "operations",
-        legacy_initial_owner=root / "initial_owner.npy",
-        legacy_current_owner=root / "current_owner.npy",
-    )
+def pack_world(w):
+    buf=io.BytesIO(); arrays={k:getattr(w,k) for k in ['background','homeland','initial_control','control','battle_age','encirclement_age','disputed']}
+    for k in ['terrain','cities','roads']:
+        layer=getattr(w.layers,k)
+        if layer is not None: arrays[k]=layer
+    arrays['meta']=np.array(json.dumps({'start_date':w.start_date,'elapsed':w.elapsed,'engine':config.ENGINE_VERSION,'physics':w.layers.settings}))
+    np.savez_compressed(buf,**arrays)
+    return buf.getvalue()
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+def unpack_world(blob):
+    with np.load(io.BytesIO(blob),allow_pickle=False) as a:
+        meta=json.loads(str(a['meta']))
+        if meta['engine']!=config.ENGINE_VERSION: raise ValueError('Несовместимая версия движка')
+        layer=Layers(settings=meta['physics'],**{k:a[k].copy() if k in a else None for k in ['terrain','cities','roads']})
+        layer.rebuild(a['control'].shape)
+        args={k:a[k].copy() for k in ['background','homeland','initial_control','control','battle_age','encirclement_age','disputed']}
+    args['homeland'].flags.writeable=False; args['initial_control'].flags.writeable=False
+    return World(**args,layers=layer,start_date=meta['start_date'],elapsed=meta['elapsed'])
 
 
-def atomic_save_npy(path: Path, arr: np.ndarray) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            np.save(f, arr)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+def pack_masks(masks):
+    b=io.BytesIO(); np.savez_compressed(b,**{str(s):m for s,m in masks.items()}); return b.getvalue()
 
 
-def create_session(
-    data_dir: Path,
-    chat_id: int,
-    base_path: Path,
-    start_date: str = "2057-01-01",
-    *,
-    terrain_path: Path | None = None,
-    cities_path: Path | None = None,
-) -> SessionPaths:
-    # Validate date before destroying an existing session.
-    date.fromisoformat(start_date)
-    with Image.open(base_path) as im:
-        if im.format != "PNG":
-            raise ValueError("базовую карту присылай PNG как файл; JPEG портит точные цвета")
-        if im.width < 64 or im.height < 64:
-            raise ValueError("карта слишком маленькая")
-        if im.width > 8192 or im.height > 8192 or im.width * im.height > 35_000_000:
-            raise ValueError("карта слишком большая; максимум 8192×8192 и 35 млн пикселей")
-        base_rgb = np.asarray(im.convert("RGB"), dtype=np.uint8)
+def unpack_masks(blob):
+    if blob is None: return {}
+    with np.load(io.BytesIO(blob),allow_pickle=False) as a: return {int(k):a[k].copy() for k in a.files}
 
-    homeland, control, territory = initial_state(base_rgb, reject_contested=True)
 
-    p = paths_for(data_dir, chat_id)
-    tmp_root = p.root.with_name(p.root.name + ".new")
-    if tmp_root.exists():
-        shutil.rmtree(tmp_root)
-    tmp_root.mkdir(parents=True, exist_ok=True)
-    try:
-        Image.fromarray(base_rgb, mode="RGB").save(tmp_root / "base.png", optimize=True)
-
-        if terrain_path is not None:
-            with Image.open(terrain_path) as tim:
-                if tim.format != "PNG":
-                    raise ValueError("physical layer must be PNG")
-                if tim.size != (base_rgb.shape[1], base_rgb.shape[0]):
-                    raise ValueError("physical layer size must match base map")
-                tim.convert("RGB").save(tmp_root / "terrain.png", optimize=True)
-
-        if cities_path is not None:
-            with Image.open(cities_path) as cim:
-                if cim.format != "PNG":
-                    raise ValueError("city layer must be PNG")
-                if cim.size != (base_rgb.shape[1], base_rgb.shape[0]):
-                    raise ValueError("city layer size must match base map")
-                rgba = cim.convert("RGBA")
-                alpha = np.asarray(rgba.getchannel("A"), dtype=np.uint8)
-                if int(alpha.max()) == 0:
-                    raise ValueError("city layer is fully transparent")
-                if int(alpha.min()) == 255:
-                    raise ValueError("city layer needs transparency; opaque background would cover the map")
-                rgba.save(tmp_root / "cities.png", optimize=True)
-
-        atomic_save_npy(tmp_root / "homeland.npy", homeland)
-        atomic_save_npy(tmp_root / "initial_control.npy", control)
-        atomic_save_npy(tmp_root / "current_control.npy", control)
-        atomic_save_npy(tmp_root / "territory.npy", territory)
-        (tmp_root / "operations").mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(
-            tmp_root / "meta.json",
-            json.dumps(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "start_date": start_date,
-                    "elapsed_days": 0,
-                    "next_operation": 1,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
-        backup = p.root.with_name(p.root.name + ".bak")
-        if backup.exists():
-            shutil.rmtree(backup, ignore_errors=True)
-        had_old = p.root.exists()
-        if had_old:
-            os.replace(p.root, backup)
+class Store:
+    def __init__(self,path):
+        self.path=str(path)
+        with self.connect() as db:
+            db.executescript('''
+            CREATE TABLE IF NOT EXISTS sessions(chat_id INTEGER PRIMARY KEY, initial BLOB NOT NULL,
+              cache BLOB NOT NULL, revision INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS operations(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+              kind TEXT NOT NULL, params TEXT NOT NULL, payload BLOB,
+              FOREIGN KEY(chat_id) REFERENCES sessions(chat_id) ON DELETE CASCADE);
+            CREATE INDEX IF NOT EXISTS operations_chat ON operations(chat_id,id);
+            CREATE TABLE IF NOT EXISTS pending(chat_id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
+              params TEXT NOT NULL, reference BLOB, hash TEXT, revision INTEGER);
+            ''')
+    @contextmanager
+    def connect(self):
+        db=sqlite3.connect(self.path,timeout=60)
+        db.execute('PRAGMA foreign_keys=ON')
         try:
-            os.replace(tmp_root, p.root)
-        except Exception:
-            if had_old and backup.exists() and not p.root.exists():
-                os.replace(backup, p.root)
-            raise
-        else:
-            if backup.exists():
-                shutil.rmtree(backup, ignore_errors=True)
-    finally:
-        if tmp_root.exists():
-            shutil.rmtree(tmp_root, ignore_errors=True)
-    return p
+            with db: yield db
+        finally:
+            db.close()
 
+    def create(self,chat_id,world):
+        blob=pack_world(world)
+        with self.connect() as db:
+            db.execute('DELETE FROM pending WHERE chat_id=?',(chat_id,))
+            db.execute('DELETE FROM sessions WHERE chat_id=?',(chat_id,))
+            db.execute('INSERT INTO sessions(chat_id,initial,cache) VALUES(?,?,?)',(chat_id,blob,blob))
 
-def load_meta(p: SessionPaths) -> dict:
-    return json.loads(p.meta.read_text(encoding="utf-8"))
+    def load(self,chat_id):
+        with self.connect() as db: row=db.execute('SELECT cache,revision FROM sessions WHERE chat_id=?',(chat_id,)).fetchone()
+        if not row: raise MissingSession('Сначала /demo или /newmap YYYY-MM-DD')
+        return unpack_world(row[0]),row[1]
 
+    def events(self,chat_id):
+        with self.connect() as db: rows=db.execute('SELECT kind,params,payload FROM operations WHERE chat_id=? ORDER BY id',(chat_id,)).fetchall()
+        return [(kind,json.loads(params),payload) for kind,params,payload in rows]
 
-def save_meta(p: SessionPaths, meta: dict) -> None:
-    _atomic_write_text(p.meta, json.dumps(meta, ensure_ascii=False, indent=2))
+    @staticmethod
+    def apply(world,kind,params,payload,on_day=None):
+        if kind=='turn':
+            simulate(world,unpack_masks(payload),params['days'],params['width'],params['seed'],on_day)
+        elif kind=='layer':
+            name=params['name']; data=None if payload is None else read_png(payload,world.control.shape)
+            setattr(world.layers,name,data); world.layers.rebuild(world.control.shape)
+        else: raise ValueError('Неизвестный тип события')
 
+    def commit(self,chat_id,kind,params,payload=None):
+        world,revision=self.load(chat_id)
+        self.apply(world,kind,params,payload)
+        blob=pack_world(world)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            current=db.execute('SELECT revision FROM sessions WHERE chat_id=?',(chat_id,)).fetchone()
+            if not current or current[0]!=revision: raise ValueError('Сессия изменилась; повторите команду')
+            db.execute('INSERT INTO operations(chat_id,kind,params,payload) VALUES(?,?,?,?)',(chat_id,kind,json.dumps(params),payload))
+            db.execute('UPDATE sessions SET cache=?,revision=revision+1 WHERE chat_id=?',(blob,chat_id))
+            db.execute('DELETE FROM pending WHERE chat_id=?',(chat_id,))
+        return world
 
-def ensure_session_schema(p: SessionPaths) -> None:
-    if not p.meta.exists():
-        return
-    meta = load_meta(p)
-    if int(meta.get("schema_version", 1)) >= SCHEMA_VERSION and p.homeland.exists() and p.current_control.exists():
-        return
+    def replay(self,chat_id,on_start=None,on_day=None,omit_last=False):
+        with self.connect() as db: row=db.execute('SELECT initial FROM sessions WHERE chat_id=?',(chat_id,)).fetchone()
+        if not row: raise MissingSession('Нет войны')
+        w=unpack_world(row[0])
+        if on_start: on_start(w)
+        events=self.events(chat_id)
+        for kind,params,payload in (events[:-1] if omit_last else events): self.apply(w,kind,params,payload,on_day)
+        return w
 
-    if not p.base.exists():
-        raise ValueError("сессия повреждена: нет base.png")
+    def undo(self,chat_id):
+        _,revision=self.load(chat_id)
+        if not self.events(chat_id): raise ValueError('Журнал пуст')
+        w=self.replay(chat_id,omit_last=True); blob=pack_world(w)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT revision FROM sessions WHERE chat_id=?',(chat_id,)).fetchone()[0]!=revision: raise ValueError('Сессия изменилась')
+            db.execute('DELETE FROM operations WHERE id=(SELECT MAX(id) FROM operations WHERE chat_id=?)',(chat_id,))
+            db.execute('UPDATE sessions SET cache=?,revision=revision+1 WHERE chat_id=?',(blob,chat_id))
+            db.execute('DELETE FROM pending WHERE chat_id=?',(chat_id,))
+        return w
 
-    base = load_rgb(p.base)
-    homeland, derived_control, territory = initial_state(base, reject_contested=False)
+    def doctor(self,chat_id):
+        # Does not trust cache: can repair even a corrupt compressed BLOB.
+        with self.connect() as db: row=db.execute('SELECT cache,revision FROM sessions WHERE chat_id=?',(chat_id,)).fetchone()
+        if not row: raise MissingSession('Нет войны')
+        w=self.replay(chat_id)
+        try:
+            cached=unpack_world(row[0])
+            same=cached.elapsed==w.elapsed and cached.start_date==w.start_date and all(np.array_equal(getattr(cached,k),getattr(w,k)) for k in ['background','initial_control','control','homeland','battle_age','encirclement_age','disputed'])
+            same &= cached.layers.settings==w.layers.settings
+            same &= all((getattr(cached.layers,k) is None and getattr(w.layers,k) is None) or (getattr(cached.layers,k) is not None and getattr(w.layers,k) is not None and np.array_equal(getattr(cached.layers,k),getattr(w.layers,k))) for k in ['terrain','cities','roads'])
+        except Exception: same=False
+        blob=pack_world(w)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT revision FROM sessions WHERE chat_id=?',(chat_id,)).fetchone()[0]!=row[1]: raise ValueError('Сессия изменилась')
+            db.execute('UPDATE sessions SET cache=?,revision=revision+? WHERE chat_id=?',(blob,int(not same),chat_id))
+            if not same: db.execute('DELETE FROM pending WHERE chat_id=?',(chat_id,))
+        return bool(same),w
 
-    initial_control = derived_control
-    current_control = derived_control.copy()
-    if p.legacy_initial_owner.exists():
-        initial_control = np.load(p.legacy_initial_owner).astype(np.uint8)
-    if p.legacy_current_owner.exists():
-        current_control = np.load(p.legacy_current_owner).astype(np.uint8)
-
-    if initial_control.shape != homeland.shape or current_control.shape != homeland.shape:
-        raise ValueError("старая сессия повреждена: размеры массивов не совпадают")
-
-    atomic_save_npy(p.homeland, homeland)
-    atomic_save_npy(p.initial_control, initial_control)
-    atomic_save_npy(p.current_control, current_control)
-    atomic_save_npy(p.territory, territory)
-    meta["schema_version"] = SCHEMA_VERSION
-    save_meta(p, meta)
-
-
-def load_state(p: SessionPaths) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    ensure_session_schema(p)
-    homeland = np.load(p.homeland).astype(np.uint8)
-    control = np.load(p.current_control).astype(np.uint8)
-    territory = np.load(p.territory).astype(bool)
-    if homeland.shape != control.shape or homeland.shape != territory.shape:
-        raise ValueError("сессия повреждена: homeland/control/territory разного размера")
-    return homeland, control, territory
-
-
-def current_date(p: SessionPaths) -> date:
-    meta = load_meta(p)
-    return date.fromisoformat(meta["start_date"]) + timedelta(days=int(meta["elapsed_days"]))
-
-
-def append_operation(p: SessionPaths, spec: dict, masks: dict[str, np.ndarray] | None = None) -> Path:
-    """Atomically commit an operation directory and then metadata."""
-    meta = load_meta(p)
-    idx = int(meta["next_operation"])
-    opdir = p.operations / f"{idx:04d}"
-    tmpdir = p.operations / f".{idx:04d}.tmp"
-    if opdir.exists():
-        raise FileExistsError(f"operation {idx} already exists")
-    if tmpdir.exists():
-        shutil.rmtree(tmpdir)
-    tmpdir.mkdir(parents=True, exist_ok=False)
-
-    try:
-        if masks:
-            for name, mask in masks.items():
-                Image.fromarray((mask.astype(np.uint8) * 255), mode="L").save(tmpdir / f"{name}.png", optimize=True)
-        _atomic_write_text(tmpdir / "spec.json", json.dumps(spec, ensure_ascii=False, indent=2))
-        os.replace(tmpdir, opdir)
-    finally:
-        if tmpdir.exists():
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-    meta["next_operation"] = idx + 1
-    meta["elapsed_days"] = int(meta["elapsed_days"]) + int(spec["days"])
-    try:
-        save_meta(p, meta)
-    except Exception:
-        # Do not leave a committed operation that metadata does not know about.
-        shutil.rmtree(opdir, ignore_errors=True)
-        raise
-    return opdir
-
-
-def list_operations(p: SessionPaths) -> list[Path]:
-    if not p.operations.exists():
-        return []
-    return sorted(x for x in p.operations.iterdir() if x.is_dir() and x.name.isdigit())
-
-
-def remove_last_operation(p: SessionPaths) -> bool:
-    ops = list_operations(p)
-    if not ops:
-        return False
-    last = ops[-1]
-    spec = json.loads((last / "spec.json").read_text(encoding="utf-8"))
-    tomb = last.with_name("." + last.name + ".undo")
-    if tomb.exists():
-        shutil.rmtree(tomb, ignore_errors=True)
-    os.replace(last, tomb)
-    meta = load_meta(p)
-    meta["next_operation"] = max(1, int(meta["next_operation"]) - 1)
-    meta["elapsed_days"] = max(0, int(meta["elapsed_days"]) - int(spec["days"]))
-    try:
-        save_meta(p, meta)
-    except Exception:
-        os.replace(tomb, last)
-        raise
-    shutil.rmtree(tomb, ignore_errors=True)
-    return True
+    def set_pending(self,chat_id,kind,params,reference=None,revision=None):
+        from layers import png_bytes
+        blob=png_bytes(reference) if reference is not None else None
+        digest=reference_hash(reference) if reference is not None else None
+        with self.connect() as db:
+            db.execute('INSERT OR REPLACE INTO pending VALUES(?,?,?,?,?,?)',(chat_id,kind,json.dumps(params),blob,digest,revision))
+    def pending(self,chat_id):
+        with self.connect() as db: row=db.execute('SELECT kind,params,reference,hash,revision FROM pending WHERE chat_id=?',(chat_id,)).fetchone()
+        return None if not row else (row[0],json.loads(row[1]),row[2],row[3],row[4])
+    def cancel(self,chat_id):
+        with self.connect() as db: db.execute('DELETE FROM pending WHERE chat_id=?',(chat_id,))

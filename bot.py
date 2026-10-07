@@ -1,786 +1,220 @@
-from __future__ import annotations
-
 import asyncio
+import io
+import logging
 import os
-import re
 import secrets
-from collections import defaultdict
+import tempfile
 from pathlib import Path
-
-import numpy as np
+from collections import defaultdict
+from datetime import date
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, Message
-from PIL import Image
+from aiogram.types import Message, BufferedInputFile, FSInputFile
+from aiogram import BaseMiddleware
+from dotenv import load_dotenv
+import config
+from storage import Store, pack_masks
+from state import World
+from layers import Layers,read_png,png_bytes
+from renderer import render
+from orders import validate_markup,reference_hash
+from exporter import export_video
+from canon import advice
 
-from engine import (
-    apply_attack,
-    apply_turn,
-    build_attack_plan,
-    city_mask_from_rgba,
-    extract_order_masks,
-    load_rgb,
-    save_rgb,
-    validate_annotation_against_reference,
-)
-from exporter import export_mp4
-from canon import WAR_END, WAR_NAME, WAR_START, canon_hint
-from palette import (
-    CONTESTED,
-    CONTROL_CONTESTED,
-    CONTROL_KEFIR,
-    CONTROL_YOGURT,
-    HOME_KEFIR,
-    HOME_YOGURT,
-    KEFIR_HOME,
-    KEFIR_OCCUPATION,
-    ORDER_KEFIR,
-    ORDER_YOGURT,
-    SIDE_TO_CONTROL,
-    YOGURT_HOME,
-    YOGURT_OCCUPATION,
-    rgb_hex,
-)
-from replay import replay_control
-from visual import load_optional_visual_layers, render_visual
-from storage import (
-    append_operation,
-    atomic_save_npy,
-    create_session,
-    current_date,
-    load_meta,
-    load_state,
-    paths_for,
-    remove_last_operation,
-)
+HELP='''Аурелия • подневный фронт
+/demo — новая война 28.06.2057, заменяет текущую
+/newmap YYYY-MM-DD — затем стартовый PNG документом
+/map — свежий PNG в исходном размере; рисуйте на нем
+/map4k — просмотр шириной 3840, не для приказов
+/turn DAYS WIDTH — одновременные приказы
+/attack kefir DAYS WIDTH или /attack yogurt DAYS WIDTH
+/wait DAYS — время без новых наступлений
+/undo — отменить последнее событие
+/doctor — переиграть журнал и восстановить кеш
+/status — дата, контроль, оккупация, серая зона в пикселях
+/terrain /cities /roads — затем PNG документом
+/clearterrain /clearcities /clearroads — удалить слой
+/layers — состояние слоев
+/canon [kefir|yogurt] — советы по хронике
+/export FPS WIDTH — все дни + начальный кадр
+/export4k FPS — ширина 3840
+/exportcurve FPS WIDTH — легкий изгиб готовых кадров
+/cancel — отменить ожидание загрузки
 
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("DATA_DIR", ROOT / "data"))
-DEMO_MAP = ROOT / "yogurtstan_base_control.png"
-DEMO_TERRAIN = ROOT / "yogurtstan_terrain.png"
-DEMO_CITIES = ROOT / "yogurtstan_cities.png"
-OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
-PENDING: dict[int, dict] = {}
-LOCKS: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+Кефирстан: #FF00FF, Йогуртстан: #00FF66
+Линии 3–8 px: начните на своей территории, закончите в направлении противника. Можно несколько отдельных кривых. WIDTH — примерный оперативный масштаб в исходных пикселях. После /turn или /attack бот присылает свежую карту. Отправьте размеченный PNG как ФАЙЛ, без JPEG и изменения размера.
+1 день = 1 кадр. Альтернативная история разрешена.'''
 
-
-def allowed(message: Message) -> bool:
-    return not OWNER_ID or (message.from_user and message.from_user.id == OWNER_ID)
-
-
-def _parse_int(value: str, lo: int, hi: int) -> int:
-    n = int(value)
-    if not (lo <= n <= hi):
-        raise ValueError(f"значение должно быть от {lo} до {hi}")
-    return n
-
-
-def _seed() -> int:
-    return secrets.randbelow(2_000_000_000 - 1) + 1
-
-
-def help_text() -> str:
-    return (
-        "Aurelia War Mapper ULTRA v5\n\n"
-        "Главный режим:\n"
-        "1) /demo\n"
-        "2) /map или /map4k\n"
-        "2.5) /canon [kefir|yogurt]\n"
-        "3) /turn 60 110\n"
-        "4) На СВЕЖЕЙ карте рисуй линии и пришли PNG как файл:\n"
-        f"   {rgb_hex(ORDER_KEFIR)} — Кефирстан\n"
-        f"   {rgb_hex(ORDER_YOGURT)} — Йогуртстан\n"
-        "   Линии могут быть кривыми, горизонтальными, диагональными и несколькими\n"
-        "5) /wait 30\n"
-        "6) /undo\n"
-        "7) /doctor — проверить и при необходимости восстановить историю\n"
-        "8) /terrain и /cities — заменить визуальные слои\n"
-        "9) /export 30 1920, /export4k 30 или /exportcurve 30 1920\n\n"
-        "Серая зона — рваная кромка 3-10 px на исходной карте.\n"
-        "Демо Йогуртстанской войны стартует с 28.06.2057 — первого дня боевых действий.\n"
-        "Родная земля и текущий контроль хранятся отдельно, поэтому оккупация красится правильно.\n"
-        "Физический слой лежит под политическими цветами, города всегда поверх.\n"
-        "Цвета: /colors"
-    )
-
-
-def _resize_rgb_to_width(arr: np.ndarray, width: int | None) -> np.ndarray:
-    if width is None or width <= 0 or arr.shape[1] == width:
-        return arr
-    h, w = arr.shape[:2]
-    if w == width:
-        return arr
-    scale = width / float(w)
-    oh = max(2, int(round(h * scale / 2) * 2))
-    return np.asarray(Image.fromarray(arr, mode="RGB").resize((width, oh), resample=Image.Resampling.LANCZOS), dtype=np.uint8)
-
-
-async def send_current(message: Message, width: int | None = None) -> None:
-    p = paths_for(DATA_DIR, message.chat.id)
-    if not p.meta.exists():
-        await message.answer("Сначала /demo или /newmap.")
-        return
-    try:
-        homeland, control, territory = load_state(p)
-        base = load_rgb(p.base)
-        terrain, cities = load_optional_visual_layers(p.terrain, p.cities, base.shape[:2])
-        rendered = render_visual(base, homeland, control, territory, terrain=terrain, cities=cities)
-        rendered = _resize_rgb_to_width(rendered, width)
-        out = p.root / ("current_render_4k.png" if width else "current_render.png")
-        save_rgb(out, rendered)
-    except Exception as e:
-        await message.answer(f"Сессия повреждена или не мигрировалась: {e}")
-        return
-    await message.answer_document(FSInputFile(out), caption=f"Текущая дата: {current_date(p).strftime('%d.%m.%Y')}")
-
-
-async def cmd_start(message: Message):
-    if allowed(message):
-        await message.answer(help_text())
-
-
-async def cmd_colors(message: Message):
-    if not allowed(message):
-        return
-    await message.answer(
-        "Палитра:\n"
-        f"Родной Кефирстан: {rgb_hex(KEFIR_HOME)}\n"
-        f"Родной Йогуртстан: {rgb_hex(YOGURT_HOME)}\n"
-        f"Кефирская оккупация Йогуртстана: {rgb_hex(KEFIR_OCCUPATION)}\n"
-        f"Йогуртстанская оккупация Кефирстана: {rgb_hex(YOGURT_OCCUPATION)}\n"
-        f"Серая зона: {rgb_hex(CONTESTED)}\n"
-        f"Приказ Кефирстана: {rgb_hex(ORDER_KEFIR)}\n"
-        f"Приказ Йогуртстана: {rgb_hex(ORDER_YOGURT)}"
-    )
-
-
-async def cmd_demo(message: Message):
-    if not allowed(message):
-        return
-    async with LOCKS[message.chat.id]:
-        try:
-            create_session(
-                DATA_DIR,
-                message.chat.id,
-                DEMO_MAP,
-                start_date="2057-06-28",
-                terrain_path=DEMO_TERRAIN,
-                cities_path=DEMO_CITIES,
-            )
-        except Exception as e:
-            await message.answer(f"Не смог создать демо: {e}")
+class OwnerGuard(BaseMiddleware):
+    def __init__(self,owner): self.owner=owner
+    async def __call__(self,handler,event,data):
+        if self.owner and (event.from_user is None or event.from_user.id!=self.owner):
+            await event.answer('Управление доступно владельцу бота')
             return
-        PENDING.pop(message.chat.id, None)
-    await message.answer("Карта загружена. Это каноническое демо Йогуртстанской войны: старт 28.06.2057, физический слой и города уже подключены.")
-    await send_current(message)
+        return await handler(event,data)
 
+class WarBot:
+    def __init__(self,store,owner=0):
+        self.store=store; self.owner=owner
+        self.locks=defaultdict(asyncio.Lock)
+        self.workers=asyncio.Semaphore(1)  # large native maps have bounded RAM
+        self.dp=Dispatcher()
+        self.dp.message.outer_middleware(OwnerGuard(owner))
+        self.dp.message.register(self.command,F.text.startswith('/'))
+        self.dp.message.register(self.document,F.document)
+        self.dp.message.register(self.photo,F.photo)
 
-async def cmd_newmap(message: Message):
-    if not allowed(message):
-        return
-    parts = (message.text or "").split()
-    start_date = "2057-01-01"
-    if len(parts) >= 2:
-        try:
-            # create_session validates ISO date too, but fail early here.
-            from datetime import date
-            date.fromisoformat(parts[1])
-            start_date = parts[1]
-        except ValueError:
-            await message.answer("Дата нужна как YYYY-MM-DD, например /newmap 2057-01-01")
-            return
-    PENDING[message.chat.id] = {"kind": "newmap", "start_date": start_date}
-    await message.answer(
-        "Пришли базовую PNG-карту как ФАЙЛ. Серой зоны на стартовой карте быть не должно: "
-        "у серого пикселя невозможно угадать родину. Оккупационные цвета разрешены."
-    )
+    async def work(self,fn,*args,**kwargs):
+        async with self.workers: return await asyncio.to_thread(fn,*args,**kwargs)
 
+    async def send_map(self,message,width=None):
+        def make():
+            w,revision=self.store.load(message.chat.id)
+            pending=self.store.pending(message.chat.id)
+            stamp=f'r{revision}'
+            if pending and pending[0]=='turn': stamp+=' / '+pending[1]['tag']
+            return png_bytes(render(w,width,stamp=stamp)),w.date.strftime('%d.%m.%Y')
+        data,dt=await self.work(make)
+        await message.answer_document(BufferedInputFile(data,filename='front_4k.png' if width else 'front.png'),caption=f'{dt} • '+('3840 px, только просмотр' if width else 'Исходный размер. Линии приказов рисуйте поверх этого PNG'))
 
-async def cmd_terrain(message: Message):
-    if not allowed(message):
-        return
-    p = paths_for(DATA_DIR, message.chat.id)
-    if not p.meta.exists():
-        await message.answer("Сначала /demo или /newmap")
-        return
-    PENDING[message.chat.id] = {"kind": "terrain"}
-    await message.answer("Пришли физический слой PNG как ФАЙЛ. Размер должен один в один совпадать с картой.")
+    async def command(self,m:Message):
+        async with self.locks[m.chat.id]:
+            try: await self._command(m)
+            except (ValueError,OSError) as e: await m.answer(str(e))
+            except Exception:
+                logging.exception('Command failed chat=%s',m.chat.id)
+                await m.answer('Ошибка расчета. Незавершенная операция не записана; подробности в консоли')
 
-
-async def cmd_cities(message: Message):
-    if not allowed(message):
-        return
-    p = paths_for(DATA_DIR, message.chat.id)
-    if not p.meta.exists():
-        await message.answer("Сначала /demo или /newmap")
-        return
-    PENDING[message.chat.id] = {"kind": "cities"}
-    await message.answer("Пришли слой городов PNG с прозрачным фоном как ФАЙЛ. Города будут рисоваться поверх фронта и физики.")
-
-
-async def cmd_layers(message: Message):
-    if not allowed(message):
-        return
-    p = paths_for(DATA_DIR, message.chat.id)
-    if not p.meta.exists():
-        await message.answer("Нет сессии.")
-        return
-    await message.answer(
-        "Визуальные слои:\n"
-        f"Физика: {'есть' if p.terrain.exists() else 'нет'}\n"
-        f"Города: {'есть' if p.cities.exists() else 'нет'}\n"
-        "Физика смешивается с политическими цветами только внутри территорий; серая зона остается плоской."
-    )
-
-
-async def cmd_clearterrain(message: Message):
-    if not allowed(message):
-        return
-    p = paths_for(DATA_DIR, message.chat.id)
-    async with LOCKS[message.chat.id]:
-        p.terrain.unlink(missing_ok=True)
-        PENDING.pop(message.chat.id, None)
-    await message.answer("Физический слой убран.")
-    await send_current(message)
-
-
-async def cmd_clearcities(message: Message):
-    if not allowed(message):
-        return
-    p = paths_for(DATA_DIR, message.chat.id)
-    async with LOCKS[message.chat.id]:
-        p.cities.unlink(missing_ok=True)
-        PENDING.pop(message.chat.id, None)
-    await message.answer("Слой городов убран.")
-    await send_current(message)
-
-
-async def cmd_turn(message: Message):
-    if not allowed(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        await message.answer("Формат: /turn 60 [width_px]. Например /turn 120 110")
-        return
-    try:
-        days = _parse_int(parts[1], 1, 5000)
-        width = 110 if len(parts) < 3 else _parse_int(parts[2], 8, 800)
-    except (ValueError, TypeError) as e:
-        await message.answer(f"Кривые параметры: {e}")
-        return
-    p = paths_for(DATA_DIR, message.chat.id)
-    if not p.meta.exists():
-        await message.answer("Сначала /demo или /newmap")
-        return
-    PENDING[message.chat.id] = {
-        "kind": "turn",
-        "days": days,
-        "width_px": width,
-        "gray_width_px": 9.0,
-        "front_noise_px": 11.0,
-    }
-    await message.answer(
-        f"Ход: {days} дней. Возьми СВЕЖИЙ /map и рисуй поверх него:\n"
-        f"{rgb_hex(ORDER_KEFIR)} — Кефирстан\n"
-        f"{rgb_hex(ORDER_YOGURT)} — Йогуртстан\n"
-        "Кривая/горизонтальная/ломаная линия нормальна. Несколько линий тоже. PNG как файл."
-    )
-
-
-async def cmd_attack(message: Message):
-    if not allowed(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 3:
-        await message.answer("Формат: /attack kefir|yogurt DAYS [width_px]")
-        return
-    side_raw = parts[1].lower()
-    if side_raw not in SIDE_TO_CONTROL:
-        await message.answer("Сторона: kefir или yogurt.")
-        return
-    try:
-        days = _parse_int(parts[2], 1, 5000)
-        width = 110 if len(parts) < 4 else _parse_int(parts[3], 8, 800)
-    except (ValueError, TypeError) as e:
-        await message.answer(f"Кривые параметры: {e}")
-        return
-    p = paths_for(DATA_DIR, message.chat.id)
-    if not p.meta.exists():
-        await message.answer("Сначала /demo или /newmap")
-        return
-    attacker = SIDE_TO_CONTROL[side_raw]
-    side = "kefir" if attacker == CONTROL_KEFIR else "yogurt"
-    PENDING[message.chat.id] = {
-        "kind": "attack",
-        "side": side,
-        "days": days,
-        "width_px": width,
-        "gray_width_px": 9.0,
-        "front_noise_px": 11.0,
-    }
-    color = rgb_hex(ORDER_KEFIR if side == "kefir" else ORDER_YOGURT)
-    await message.answer(
-        f"{side}: {days} дней. Нарисуй линию {color} на СВЕЖЕМ /map от своей зоны в сторону цели и пришли PNG как файл."
-    )
-
-
-
-
-async def cmd_canon(message: Message):
-    if not allowed(message):
-        return
-    p = paths_for(DATA_DIR, message.chat.id)
-    side = None
-    parts = (message.text or "").split()
-    if len(parts) >= 2:
-        raw = parts[1].lower()
-        if raw in ("kefir", "yogurt"):
-            side = raw
-    if not p.meta.exists():
-        await message.answer(canon_hint(WAR_START, side=side))
-        return
-    await message.answer(canon_hint(current_date(p), side=side))
-
-
-async def cmd_wait(message: Message):
-    if not allowed(message):
-        return
-    p = paths_for(DATA_DIR, message.chat.id)
-    if not p.meta.exists():
-        await message.answer("Сначала /demo или /newmap")
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await message.answer("Формат: /wait 30")
-        return
-    try:
-        days = _parse_int(parts[1], 1, 5000)
-    except ValueError as e:
-        await message.answer(f"Нужно нормальное число дней: {e}")
-        return
-    async with LOCKS[message.chat.id]:
-        append_operation(p, {"kind": "wait", "days": days})
-        PENDING.pop(message.chat.id, None)
-    await message.answer(f"Промотал {days} дней. Дата: {current_date(p).strftime('%d.%m.%Y')}")
-
-
-async def cmd_map(message: Message):
-    if allowed(message):
-        await send_current(message)
-
-
-async def cmd_map4k(message: Message):
-    if allowed(message):
-        await send_current(message, width=3840)
-
-
-async def cmd_status(message: Message):
-    if not allowed(message):
-        return
-    p = paths_for(DATA_DIR, message.chat.id)
-    if not p.meta.exists():
-        await message.answer("Нет войны. /demo")
-        return
-    try:
-        homeland, control, territory = load_state(p)
-        meta = load_meta(p)
-        k_occ = int(((homeland == HOME_YOGURT) & (control == CONTROL_KEFIR)).sum())
-        y_occ = int(((homeland == HOME_KEFIR) & (control == CONTROL_YOGURT)).sum())
-        gray = int((territory & (control == CONTROL_CONTESTED)).sum())
-    except Exception as e:
-        await message.answer(f"Сессия сломана: {e}")
-        return
-    await message.answer(
-        f"Старт: {meta['start_date']}\n"
-        f"Прошло дней: {meta['elapsed_days']}\n"
-        f"Текущая дата: {current_date(p).strftime('%d.%m.%Y')}\n"
-        f"Ходов: {int(meta['next_operation']) - 1}\n"
-        f"Кефирская оккупация: {k_occ:,} px\n"
-        f"Йогуртстанская оккупация: {y_occ:,} px\n"
-        f"Серая зона: {gray:,} px"
-    )
-
-
-async def cmd_cancel(message: Message):
-    if not allowed(message):
-        return
-    if PENDING.pop(message.chat.id, None):
-        await message.answer("Ожидавшийся приказ отменен.")
-    else:
-        await message.answer("Нечего отменять.")
-
-
-async def cmd_undo(message: Message):
-    if not allowed(message):
-        return
-    p = paths_for(DATA_DIR, message.chat.id)
-    async with LOCKS[message.chat.id]:
-        if not p.meta.exists() or not remove_last_operation(p):
-            await message.answer("Откатывать нечего.")
-            return
-        try:
-            control = replay_control(p)
-            atomic_save_npy(p.current_control, control)
-        except Exception as e:
-            await message.answer(f"Операция удалена, но переигровка сломалась: {e}")
-            return
-        PENDING.pop(message.chat.id, None)
-    await message.answer(f"Последний ход похоронен. Дата снова {current_date(p).strftime('%d.%m.%Y')}.")
-    await send_current(message)
-
-
-async def cmd_doctor(message: Message):
-    if not allowed(message):
-        return
-    p = paths_for(DATA_DIR, message.chat.id)
-    if not p.meta.exists():
-        await message.answer("Нет сессии для проверки.")
-        return
-    await message.answer("Переигрываю историю и сверяю состояние. Это может занять немного времени.")
-    loop = asyncio.get_running_loop()
-    async with LOCKS[message.chat.id]:
-        try:
-            homeland, cached, territory = load_state(p)
-            base = load_rgb(p.base)
-            load_optional_visual_layers(p.terrain, p.cities, base.shape[:2])
-            replayed = await loop.run_in_executor(None, lambda: replay_control(p))
-            diff = int(np.count_nonzero(cached != replayed))
-            if diff:
-                atomic_save_npy(p.current_control, replayed)
-                repaired = True
+    async def _command(self,m):
+        parts=m.text.split(); cmd=parts[0].split('@')[0].lower(); args=parts[1:]; chat=m.chat.id
+        if cmd in ['/start','/help']:
+            await m.answer(HELP); return
+        if cmd=='/cancel':
+            await self.work(self.store.cancel,chat); await m.answer('Ожидание загрузки отменено'); return
+        if cmd=='/demo':
+            if args: raise ValueError('/demo без параметров')
+            def create():
+                base=read_png((config.ROOT/'yogurtstan_demo_control.png').read_bytes())
+                layers=Layers(**{k:read_png((config.ROOT/f'yogurtstan_{k}.png').read_bytes(),base.shape[:2]) for k in ['terrain','cities','roads']})
+                self.store.create(chat,World.create(base,'2057-06-28',layers))
+            await m.answer('Создаю новую Йогуртстанскую войну…')
+            await self.work(create); await self.send_map(m); return
+        if cmd=='/newmap':
+            if len(args)!=1: raise ValueError('/newmap YYYY-MM-DD')
+            date.fromisoformat(args[0])
+            await self.work(self.store.set_pending,chat,'newmap',{'date':args[0]})
+            await m.answer('Отправьте стартовую карту PNG как документ. Она заменит текущую войну. Пользовательские слои загрузите после нее'); return
+        if cmd in ['/terrain','/cities','/roads']:
+            await self.work(self.store.load,chat)
+            if args: raise ValueError(cmd+' без параметров')
+            await self.work(self.store.set_pending,chat,'layer',{'name':cmd[1:]})
+            await m.answer('Отправьте PNG исходного размера как документ. Для городов нужен прозрачный фон. Дороги: прозрачный слой или белая маска на черном фоне'); return
+        if cmd in ['/clearterrain','/clearcities','/clearroads']:
+            name=cmd[len('/clear'):]
+            await self.work(self.store.commit,chat,'layer',{'name':name})
+            await m.answer('Слой удален; изменение сохранено в журнале'); return
+        if cmd in ['/turn','/attack']:
+            if cmd=='/attack':
+                if len(args)!=3 or args[0] not in ['kefir','yogurt']: raise ValueError('/attack kefir|yogurt DAYS WIDTH')
+                sides=[1 if args[0]=='kefir' else 2]; days,width=map(int,args[1:])
             else:
-                repaired = False
-            if homeland.shape != territory.shape or homeland.shape != replayed.shape:
-                raise ValueError("размеры state-массивов не совпадают")
-            meta = load_meta(p)
-        except Exception as e:
-            await message.answer(f"Doctor нашел тяжелую поломку и не стал выдумывать лечение: {e}")
+                if len(args)!=2: raise ValueError('/turn DAYS WIDTH')
+                sides=[1,2]; days,width=map(int,args)
+            if not 1<=days<=config.MAX_DAYS or not 2<=width<=config.MAX_WIDTH: raise ValueError('DAYS: 1..1460, WIDTH: 2..1200')
+            def pending():
+                w,rev=self.store.load(chat); tag=secrets.token_hex(4)
+                reference=render(w,stamp=f'r{rev} / {tag}')
+                self.store.set_pending(chat,'turn',{'days':days,'width':width,'sides':sides,'seed':secrets.randbits(31),'tag':tag},reference,rev)
+            await self.work(pending)
+            await m.answer(f'Приказ на {days} дней, масштаб {width} px. Используйте СВЕЖИЙ PNG ниже')
+            await self.send_map(m); return
+        if cmd=='/wait':
+            if len(args)!=1: raise ValueError('/wait DAYS')
+            days=int(args[0])
+            if not 1<=days<=config.MAX_DAYS: raise ValueError('DAYS: 1..1460')
+            await m.answer('Считаю дни, сопротивление окружений и бои…')
+            await self.work(self.store.commit,chat,'turn',{'days':days,'width':20,'seed':0},pack_masks({}))
+            await self.send_map(m); return
+        if cmd in ['/map','/map4k']:
+            await self.send_map(m,3840 if cmd=='/map4k' else None); return
+        if cmd=='/undo':
+            await m.answer('Отменяю последнее событие и переигрываю журнал…')
+            await self.work(self.store.undo,chat); await self.send_map(m); return
+        if cmd=='/doctor':
+            await m.answer('Проверяю журнал полным повторным расчетом…')
+            same,w=await self.work(self.store.doctor,chat)
+            await m.answer('Replay совпадает пиксель в пиксель' if same else 'Кеш расходился с журналом и восстановлен. Возьмите свежую /map'); return
+        if cmd in ['/status','/layers','/canon']:
+            w,_=await self.work(self.store.load,chat)
+            if cmd=='/status':
+                s=w.stats(); total=int(w.territory.sum())
+                await m.answer(f"{w.date:%d.%m.%Y} • прошло {s['days']} дней\nКонтроль (без серой зоны):\nКефирстан: {s['kefir']:,} px ({s['kefir']/total:.2%})\nЙогуртстан: {s['yogurt']:,} px ({s['yogurt']/total:.2%})\nКефирская оккупация: {s['kefir_occupation']:,} px\nЙогуртская оккупация: {s['yogurt_occupation']:,} px\nContested: {s['contested']:,} px\nПлощадь измеряется в пикселях: масштаб км²/px не задан".replace(',',' '))
+            elif cmd=='/layers':
+                await m.answer(f'Исходное разрешение: {w.control.shape[1]}×{w.control.shape[0]}\n'+ '\n'.join(f'{k}: '+('загружен' if getattr(w.layers,k) is not None else 'нет') for k in ['terrain','cities','roads']))
+            else:
+                if len(args)>1 or (args and args[0] not in ['kefir','yogurt']): raise ValueError('/canon [kefir|yogurt]')
+                await m.answer(advice(w.date,args[0] if args else None))
             return
-    if repaired:
-        await message.answer(
-            f"Нашел рассинхрон на {diff:,} пикселях и восстановил current_control из журнала операций. "
-            f"Дата: {current_date(p).strftime('%d.%m.%Y')}"
-        )
-    else:
-        await message.answer(
-            f"Сессия здорова: replay совпадает с кешем, операций {int(meta['next_operation']) - 1}, "
-            f"дата {current_date(p).strftime('%d.%m.%Y')}."
-        )
-
-
-async def _run_export(message: Message, fps: int, width: int, curved: bool = False) -> None:
-    p = paths_for(DATA_DIR, message.chat.id)
-    if not p.meta.exists():
-        await message.answer("Сначала создай войну.")
-        return
-    suffix = "_4k" if width >= 3800 else ""
-    curve_suffix = "_curve" if curved else ""
-    out = p.root / f"war_export{curve_suffix}{suffix}.mp4"
-    curve_text = ", curved mode" if curved else ""
-    await message.answer(f"Рендерю {load_meta(p)['elapsed_days']} дней: {fps} fps, до {width}px{curve_text}.")
-    loop = asyncio.get_running_loop()
-    async with LOCKS[message.chat.id]:
-        try:
-            await loop.run_in_executor(None, lambda: export_mp4(p, out, fps=fps, max_width=width, stamp_dates=True, curved=curved))
-        except Exception as e:
-            await message.answer(f"Экспорт сдох: {e}")
-            return
-    caption = "Война целиком: стартовый кадр + 1 кадр на каждый прошедший день."
-    if curved:
-        caption += " Экспорт в слегка изогнутом режиме."
-    try:
-        await message.answer_video(FSInputFile(out), caption=caption, supports_streaming=True)
-    except Exception:
-        await message.answer_document(FSInputFile(out), caption=caption)
-
-
-async def cmd_export(message: Message):
-    if not allowed(message):
-        return
-    parts = (message.text or "").split()
-    try:
-        fps = 30 if len(parts) < 2 else _parse_int(parts[1], 1, 60)
-        width = 1920 if len(parts) < 3 else _parse_int(parts[2], 640, 4096)
-    except ValueError as e:
-        await message.answer(f"Формат: /export 30 1920. {e}")
-        return
-    await _run_export(message, fps, width)
-
-
-async def cmd_export4k(message: Message):
-    if not allowed(message):
-        return
-    parts = (message.text or "").split()
-    try:
-        fps = 30 if len(parts) < 2 else _parse_int(parts[1], 1, 60)
-    except ValueError as e:
-        await message.answer(f"Формат: /export4k 30. {e}")
-        return
-    await _run_export(message, fps, 3840)
-
-
-async def cmd_exportcurve(message: Message):
-    if not allowed(message):
-        return
-    parts = (message.text or "").split()
-    try:
-        fps = 30 if len(parts) < 2 else _parse_int(parts[1], 1, 60)
-        width = 1920 if len(parts) < 3 else _parse_int(parts[2], 640, 4096)
-    except ValueError as e:
-        await message.answer(f"Формат: /exportcurve 30 1920. {e}")
-        return
-    await _run_export(message, fps, width, curved=True)
-
-
-async def _download_png_document(message: Message, bot: Bot, root: Path) -> Path | None:
-    if not message.document:
-        return None
-    name = message.document.file_name or "upload.png"
-    if not name.lower().endswith(".png"):
-        return None
-    if message.document.file_size and message.document.file_size > 60 * 1024 * 1024:
-        return None
-    root.mkdir(parents=True, exist_ok=True)
-    tmp = root / re.sub(r"[^A-Za-z0-9._-]+", "_", name)
-    await bot.download(message.document, destination=tmp)
-    return tmp
-
-
-def _validate_png_dimensions(path: Path, expected: tuple[int, int] | None = None) -> tuple[int, int]:
-    with Image.open(path) as im:
-        if im.format != "PNG":
-            raise ValueError("нужен настоящий PNG, а не JPEG с усами .png")
-        w, h = im.size
-        if w < 64 or h < 64:
-            raise ValueError("картинка слишком маленькая")
-        if w > 8192 or h > 8192 or w * h > 35_000_000:
-            raise ValueError("картинка слишком большая; лимит 35 млн пикселей")
-        if expected and (w, h) != expected:
-            raise ValueError(f"размер должен быть {expected[0]}×{expected[1]}, а пришло {w}×{h}")
-        return w, h
-
-
-async def handle_document(message: Message, bot: Bot):
-    if not allowed(message) or not message.document:
-        return
-    pending = PENDING.get(message.chat.id)
-    if not pending:
-        return
-
-    tmp = await _download_png_document(message, bot, DATA_DIR / str(message.chat.id) / "incoming")
-    if tmp is None:
-        await message.answer("Нужен PNG как ФАЙЛ. Не фото, не JPEG, не скриншот через мясорубку Telegram.")
-        return
-
-    async with LOCKS[message.chat.id]:
-        # Pending may have been consumed while this document was waiting for the lock.
-        pending = PENDING.get(message.chat.id)
-        if not pending:
-            return
-
-        if pending["kind"] == "newmap":
+        if cmd in ['/export','/export4k','/exportcurve']:
+            if cmd=='/export4k':
+                if len(args)!=1: raise ValueError('/export4k FPS')
+                fps,width=int(args[0]),3840
+            else:
+                if len(args)!=2: raise ValueError(cmd+' FPS WIDTH')
+                fps,width=map(int,args)
+            if not 1<=fps<=60 or not 64<=width<=4096: raise ValueError('FPS: 1..60, WIDTH: 64..4096')
+            await self.work(self.store.load,chat)
+            await m.answer('Переигрываю историю и кодирую видео. 1 день = 1 кадр + стартовый кадр…')
+            fd,path=tempfile.mkstemp(suffix='.mp4'); os.close(fd)
             try:
-                _validate_png_dimensions(tmp)
-                create_session(DATA_DIR, message.chat.id, tmp, start_date=pending.get("start_date", "2057-01-01"))
-            except Exception as e:
-                await message.answer(f"Карту не принял: {e}")
-                return
-            PENDING.pop(message.chat.id, None)
-            await message.answer("Карта принята. Родная принадлежность сохранена отдельно от контроля.")
-            await send_current(message)
+                result=await self.work(export_video,self.store,chat,path,fps,width,cmd=='/exportcurve')
+                if Path(path).stat().st_size>config.MAX_EXPORT_BYTES:
+                    raise ValueError('Видео превышает 49 MB. Экспортируйте с меньшей шириной')
+                await m.answer_document(FSInputFile(path,filename='aurelia_curved.mp4' if cmd=='/exportcurve' else 'aurelia.mp4'),caption=f"{result['frames']} кадров • {result['width']}×{result['height']} • {fps} FPS")
+            finally: Path(path).unlink(missing_ok=True)
             return
+        raise ValueError('Неизвестная команда. /help')
 
-        p = paths_for(DATA_DIR, message.chat.id)
-        if not p.meta.exists():
-            await message.answer("Сначала /demo или /newmap")
-            return
-
-        if pending["kind"] in {"terrain", "cities"}:
-            base = load_rgb(p.base)
+    async def document(self,m:Message):
+        async with self.locks[m.chat.id]:
             try:
-                _validate_png_dimensions(tmp, expected=(base.shape[1], base.shape[0]))
-                with Image.open(tmp) as im:
-                    if pending["kind"] == "terrain":
-                        layer = im.convert("RGB")
-                        dest = p.terrain
-                    else:
-                        layer = im.convert("RGBA")
-                        alpha = np.asarray(layer.getchannel("A"), dtype=np.uint8)
-                        if int(alpha.max()) == 0:
-                            raise ValueError("слой городов полностью прозрачный")
-                        if int(alpha.min()) == 255:
-                            raise ValueError("у слоя городов нет прозрачности; непрозрачный фон закроет всю карту")
-                        dest = p.cities
-                    tmp_dest = dest.with_suffix(dest.suffix + ".tmp")
-                    layer.save(tmp_dest, format="PNG", optimize=True)
-                    os.replace(tmp_dest, dest)
-            except Exception as e:
-                await message.answer(f"Слой не принял: {e}")
-                return
-            PENDING.pop(message.chat.id, None)
-            await message.answer("Слой установлен. Возьми новый /map перед следующим приказом.")
-            await send_current(message)
-            return
+                pending=await self.work(self.store.pending,m.chat.id)
+                if not pending: raise ValueError('Сначала /turn, /attack, /newmap, /terrain, /cities или /roads')
+                if m.document.file_size and m.document.file_size>config.MAX_UPLOAD_BYTES: raise ValueError('Максимум PNG: 19 MB')
+                buf=io.BytesIO(); await m.bot.download(m.document,destination=buf); data=buf.getvalue()
+                if len(data)>config.MAX_UPLOAD_BYTES: raise ValueError('Максимум PNG: 19 MB')
+                kind,params,ref,digest,revision=pending
+                if kind=='newmap':
+                    def create(): self.store.create(m.chat.id,World.create(read_png(data),params['date']))
+                    await self.work(create); await self.work(self.store.cancel,m.chat.id)
+                elif kind=='layer':
+                    await self.work(self.store.commit,m.chat.id,'layer',params,data)
+                elif kind=='turn':
+                    def validate():
+                        w,rev=self.store.load(m.chat.id)
+                        if rev!=revision: raise ValueError('Состояние изменилось. Начните новый /turn')
+                        reference=read_png(ref)[:,:,:3]
+                        if reference_hash(reference)!=digest: raise ValueError('Поврежден reference. Начните новый /turn')
+                        masks=validate_markup(data,reference,params['sides'])
+                        return pack_masks(masks)
+                    payload=await self.work(validate)
+                    await m.answer(f"Считаю {params['days']} дней в исходном разрешении…")
+                    await self.work(self.store.commit,m.chat.id,'turn',{k:params[k] for k in ['days','width','seed']},payload)
+                await self.send_map(m)
+            except (ValueError,OSError) as e: await m.answer(str(e))
+            except Exception:
+                logging.exception('Upload failed chat=%s',m.chat.id)
+                await m.answer('Не удалось обработать файл. Операция не записана; подробности в консоли')
+    async def photo(self,m):
+        await m.answer('Отправьте PNG как документ / файл, без сжатия. Telegram-фото не подходит')
 
-        base = load_rgb(p.base)
-        try:
-            _validate_png_dimensions(tmp, expected=(base.shape[1], base.shape[0]))
-            annotated = load_rgb(tmp)
-            homeland, control, territory = load_state(p)
-        except Exception as e:
-            await message.answer(f"Не смог прочитать карту: {e}")
-            return
-
-        terrain, cities = load_optional_visual_layers(p.terrain, p.cities, base.shape[:2])
-        city_mask = city_mask_from_rgba(cities)
-        reference = render_visual(base, homeland, control, territory, terrain=terrain, cities=cities)
-        masks = extract_order_masks(annotated)
-        ok, reason = validate_annotation_against_reference(annotated, reference, masks)
-        if not ok:
-            await message.answer(reason or "Это не последний кадр карты.")
-            return
-
-        days = int(pending["days"])
-        width = int(pending["width_px"])
-        gray = float(pending["gray_width_px"])
-        noise = float(pending["front_noise_px"])
-
-        if pending["kind"] == "attack":
-            attacker = CONTROL_KEFIR if pending["side"] == "kefir" else CONTROL_YOGURT
-            order = masks[attacker]
-            if not order.any():
-                await message.answer("Не вижу линии нужной стороны точного цвета. Приказ пока не записан.")
-                return
-            seed = _seed()
-            try:
-                plan = build_attack_plan(control, territory, order, attacker, days, width, gray, noise, seed)
-                final_control = apply_attack(control, plan, homeland=homeland, territory=territory, city_mask=city_mask)
-            except ValueError as e:
-                await message.answer(f"Не смог построить наступление: {e}")
-                return
-
-            spec = {
-                "kind": "attack",
-                "side": pending["side"],
-                "days": days,
-                "width_px": width,
-                "gray_width_px": gray,
-                "front_noise_px": noise,
-                "seed": seed,
-                "order_name": "order",
-            }
-            try:
-                append_operation(p, spec, {"order": order})
-                atomic_save_npy(p.current_control, final_control)
-            except Exception as e:
-                # History is authoritative. If the cache write failed after the
-                # operation commit, rebuild it immediately.
-                try:
-                    atomic_save_npy(p.current_control, replay_control(p))
-                except Exception:
-                    pass
-                await message.answer(f"Не смог надежно записать ход: {e}")
-                return
-
-            PENDING.pop(message.chat.id, None)
-            msg = f"Наступление проведено за {days} дней. Дата: {current_date(p).strftime('%d.%m.%Y')}"
-            if plan.warnings:
-                msg += "\nПредупреждения:\n- " + "\n- ".join(plan.warnings)
-            await message.answer(msg)
-            await send_current(message)
-            return
-
-        if pending["kind"] == "turn":
-            has_k = bool(masks[CONTROL_KEFIR].any())
-            has_y = bool(masks[CONTROL_YOGURT].any())
-            if not has_k and not has_y:
-                await message.answer("Не вижу ни розовой, ни зеленой линии. Генштаб прислал чистую карту, мощно.")
-                return
-
-            kp = yp = None
-            spec = {"kind": "turn", "days": days, "kefir": None, "yogurt": None}
-            save_masks: dict[str, np.ndarray] = {}
-            errors: list[str] = []
-            warnings: list[str] = []
-
-            if has_k:
-                ks = _seed()
-                try:
-                    kp = build_attack_plan(control, territory, masks[CONTROL_KEFIR], CONTROL_KEFIR, days, width, gray, noise, ks)
-                    spec["kefir"] = {"width_px": width, "gray_width_px": gray, "front_noise_px": noise, "seed": ks}
-                    save_masks["kefir"] = masks[CONTROL_KEFIR]
-                    warnings += ["Кефирстан: " + w for w in kp.warnings]
-                except ValueError as e:
-                    errors.append(f"Кефирстан: {e}")
-
-            if has_y:
-                ys = _seed()
-                try:
-                    yp = build_attack_plan(control, territory, masks[CONTROL_YOGURT], CONTROL_YOGURT, days, width, gray, noise, ys)
-                    spec["yogurt"] = {"width_px": width, "gray_width_px": gray, "front_noise_px": noise, "seed": ys}
-                    save_masks["yogurt"] = masks[CONTROL_YOGURT]
-                    warnings += ["Йогуртстан: " + w for w in yp.warnings]
-                except ValueError as e:
-                    errors.append(f"Йогуртстан: {e}")
-
-            # Atomic semantics: if the user drew an order for a side and it is
-            # invalid, reject the whole turn. No half-turn surprise bullshit.
-            if errors:
-                await message.answer("Ход НЕ записан. Исправь линии:\n- " + "\n- ".join(errors))
-                return
-
-            try:
-                final_control = apply_turn(control, kp, yp, days, homeland=homeland, territory=territory, city_mask=city_mask)
-                append_operation(p, spec, save_masks)
-                atomic_save_npy(p.current_control, final_control)
-            except Exception as e:
-                try:
-                    atomic_save_npy(p.current_control, replay_control(p))
-                except Exception:
-                    pass
-                await message.answer(f"Ход не удалось надежно записать: {e}")
-                return
-
-            PENDING.pop(message.chat.id, None)
-            msg = f"Ход на {days} дней проведен. Дата: {current_date(p).strftime('%d.%m.%Y')}"
-            if warnings:
-                msg += "\nПредупреждения:\n- " + "\n- ".join(warnings)
-            await message.answer(msg)
-            await send_current(message)
-
-
-async def main() -> None:
-    token = os.environ.get("BOT_TOKEN", "").strip()
-    if not token:
-        raise SystemExit("Set BOT_TOKEN environment variable")
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    bot = Bot(token=token)
-    dp = Dispatcher()
-    dp.message.register(cmd_start, CommandStart())
-    dp.message.register(cmd_demo, Command("demo"))
-    dp.message.register(cmd_newmap, Command("newmap"))
-    dp.message.register(cmd_terrain, Command("terrain"))
-    dp.message.register(cmd_cities, Command("cities"))
-    dp.message.register(cmd_layers, Command("layers"))
-    dp.message.register(cmd_clearterrain, Command("clearterrain"))
-    dp.message.register(cmd_clearcities, Command("clearcities"))
-    dp.message.register(cmd_turn, Command("turn"))
-    dp.message.register(cmd_attack, Command("attack"))
-    dp.message.register(cmd_wait, Command("wait"))
-    dp.message.register(cmd_canon, Command("canon"))
-    dp.message.register(cmd_map, Command("map"))
-    dp.message.register(cmd_map4k, Command("map4k"))
-    dp.message.register(cmd_status, Command("status"))
-    dp.message.register(cmd_doctor, Command("doctor"))
-    dp.message.register(cmd_colors, Command("colors"))
-    dp.message.register(cmd_cancel, Command("cancel"))
-    dp.message.register(cmd_undo, Command("undo"))
-    dp.message.register(cmd_export, Command("export"))
-    dp.message.register(cmd_export4k, Command("export4k"))
-    dp.message.register(cmd_exportcurve, Command("exportcurve"))
-    dp.message.register(handle_document, F.document)
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+async def main():
+    load_dotenv(config.ROOT/'.env')
+    token=os.getenv('BOT_TOKEN','').strip()
+    if not token or token=='...': raise ValueError('Заполните BOT_TOKEN в файле .env рядом с run.py')
+    owner=int(os.getenv('OWNER_ID','0') or '0')
+    filename=os.getenv('DATA_FILE','war_state.sqlite3')
+    if Path(filename).name!=filename or filename in ['.','..']: raise ValueError('DATA_FILE должен быть именем файла, без папок')
+    app=WarBot(Store(config.ROOT/filename),owner)
+    async with Bot(token) as bot:
+        await bot.delete_webhook(drop_pending_updates=False)
+        await app.dp.start_polling(bot,close_bot_session=False)
