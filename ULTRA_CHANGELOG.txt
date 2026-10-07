@@ -1,0 +1,12 @@
+v5
+- demo now starts on 2057-06-28 instead of 2057-01-01
+- added /canon command with lore-grounded phase hints for Yogurtstan war
+- added curved export mode /exportcurve
+- added new demo video example ultra_v5_curved_30days.mp4
+
+ULTRA v4
+- добавлен /map4k и /export4k
+- серая зона теперь 3-10 px с детерминированной пространственной вариативностью
+- одиночная линия больше не дает слишком жирный коридор; фронт заужен и сильнее рваный
+- окруженные карманы без городов автоматически переходят противнику
+- replay/export/bot учитывают окружение и городской слой
