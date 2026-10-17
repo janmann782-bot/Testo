@@ -77,7 +77,7 @@ public final class MainActivity extends ComponentActivity {
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
             .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
             .setContourMode(FaceDetectorOptions.CONTOUR_MODE_NONE)
-            .setMinFaceSize(.15f).build();
+            .setMinFaceSize(.12f).build();
         faceDetector=FaceDetection.getClient(options);
         makeUi();
         if(!hasCamera())requestPermissions(new String[]{Manifest.permission.CAMERA},CAMERA_PERMISSION);
@@ -175,7 +175,7 @@ public final class MainActivity extends ComponentActivity {
         cameraProvider.unbindAll();
         ImageAnalysis stream=new ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setTargetResolution(new Size(640,480))
+            .setTargetResolution(new Size(480,360))
             .setTargetRotation(getWindowManager().getDefaultDisplay().getRotation())
             .build();
         currentAnalysis=stream;

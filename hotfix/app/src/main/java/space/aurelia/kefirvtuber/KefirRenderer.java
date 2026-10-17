@@ -23,7 +23,7 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
     private final Context context;
     private final SnapshotListener listener;
     private OfficeModel office;
-    private Mesh3D head,facePatch,eyeOutline,eyeWhite,mouthBlack,cube;
+    private Mesh3D head,eyeOutline,eyeWhite,mouthBlack,cube;
     private int program,attributePosition,attributeNormal,attributeUv,uniformMvp,uniformModel,uniformColor,uniformTexture,uniformSampler,uniformShadow;
     private final float[] proj=new float[16],view=new float[16],vp=new float[16],base=new float[16];
     private final float[] model=new float[16],tmp=new float[16],mvp=new float[16];
@@ -66,12 +66,10 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
         }
         try{office=new OfficeModel(context.getAssets());}catch(Exception e){android.util.Log.e("KefirVTuber","3D office OBJ loading failed",e);}
         head=Mesh3D.countryball();cube=Mesh3D.unitCube();
-        // A small smooth face patch hides the harsh white X intersection
-        // that previously read as a gigantic nose between the eyes.
-        facePatch=Mesh3D.discOnBall(0,0,.40f,.46f,.020f,96);
-        eyeOutline=Mesh3D.discOnBall(0,0,.215f,.255f,.050f,68);
-        eyeWhite=Mesh3D.discOnBall(0,0,.178f,.218f,.073f,68);
-        mouthBlack=Mesh3D.discOnBall(0,0,.14f,.10f,.065f,68);
+        // The flag remains visible; no protruding white face mask.
+        eyeOutline=Mesh3D.discOnBall(0,0,.215f,.255f,.018f,68);
+        eyeWhite=Mesh3D.discOnBall(0,0,.178f,.218f,.027f,68);
+        mouthBlack=Mesh3D.discOnBall(0,0,.13f,.06f,.022f,68);
     }
     @Override public void onSurfaceChanged(GL10 gl,int width,int height){
         this.width=Math.max(1,width);this.height=Math.max(1,height);
@@ -97,8 +95,8 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
         lastFrameNanos=now;
         Pose target=requested;
         if(SystemClock.uptimeMillis()-target.timeMillis>950)target=Pose.neutral();
-        float t=1f-(float)Math.exp(-dt*38f);
-        smooth=interpolate(smooth,target,t);
+        // Direct per-render-frame pose: no deliberate smoothing or trailing behind head.
+        smooth=target;
         drawOffice();
         drawCountryball(now*.000000001f);
         if(snap){snap=false;captureFrame();}
@@ -144,18 +142,13 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
         Matrix.rotateM(model,0,(mirror?-1:1)*smooth.yaw*39f,0,1,0);
         float[] headMat=model.clone();
         draw(head,headMat,new float[]{1,1,1,1},"flag_kefiristan");
-        // Flush surface, not a protruding 3D nose.
-        float[] mask=headMat.clone();
-        float maskY=-.05f;
-        Matrix.translateM(mask,0,0,maskY,(float)Math.sqrt(1-maskY*maskY));
-        draw(facePatch,mask,color("#ffffff"),null);
         eye(headMat,-.30f,.14f,Math.max(.02f,smooth.eyeLeft));
         eye(headMat,.30f,.14f,Math.max(.02f,smooth.eyeRight));
         float opening=Pose.clamp(Math.max(smooth.mouth,audioEnabled?micLevel:0),0,1);
         float mouthY=-.46f;
         float[] mouthMatrix=headMat.clone();
         Matrix.translateM(mouthMatrix,0,0,mouthY,(float)Math.sqrt(1-mouthY*mouthY));
-        scaleAndDraw(mouthBlack,mouthMatrix,1f,.22f+opening*.94f,1f,color("#0a090b"));
+        scaleAndDraw(mouthBlack,mouthMatrix,1f,.28f+opening*2.8f,1f,color("#0a090b"));
     }
     private void eye(float[] headMat,float x,float y,float openness){
         float z=(float)Math.sqrt(1-x*x-y*y);
