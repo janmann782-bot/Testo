@@ -16,6 +16,9 @@ jobs:
       - name: Extract Android sources
         run: |
           unzip -qo project-source.zip -d .
+          cp -a hotfix/app/. app/
+          test -f app/src/main/java/space/aurelia/kefirvtuber/MainActivity.java
+          grep -q SCREEN_ORIENTATION_LANDSCAPE app/src/main/java/space/aurelia/kefirvtuber/MainActivity.java
           test -f app/build.gradle
           test -f app/src/main/assets/presidential_office.obj
           echo "Source and 3D assets found"
