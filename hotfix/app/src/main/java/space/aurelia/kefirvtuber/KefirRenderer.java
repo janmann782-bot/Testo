@@ -23,7 +23,7 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
     private final Context context;
     private final SnapshotListener listener;
     private OfficeModel office;
-    private Mesh3D head,eyeOutline,eyeWhite,mouthBlack,cube;
+    private Mesh3D head,faceMask,eyeOutline,eyeWhite,mouthBlack,cube;
     private int program,attributePosition,attributeNormal,attributeUv,uniformMvp,uniformModel,uniformColor,uniformTexture,uniformSampler,uniformShadow;
     private final float[] proj=new float[16],view=new float[16],vp=new float[16],base=new float[16];
     private final float[] model=new float[16],tmp=new float[16],mvp=new float[16];
@@ -66,10 +66,11 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
         }
         try{office=new OfficeModel(context.getAssets());}catch(Exception e){android.util.Log.e("KefirVTuber","3D office OBJ loading failed",e);}
         head=Mesh3D.countryball();cube=Mesh3D.unitCube();
-        // The flag remains visible; no protruding white face mask.
-        eyeOutline=Mesh3D.discOnBall(0,0,.215f,.255f,.018f,68);
-        eyeWhite=Mesh3D.discOnBall(0,0,.178f,.218f,.027f,68);
-        mouthBlack=Mesh3D.discOnBall(0,0,.13f,.06f,.022f,68);
+        // Smooth, nearly flush painted facial region, not a protruding mesh nose.
+        faceMask=Mesh3D.discOnBall(0,0,.54f,.50f,.004f,96);
+        eyeOutline=Mesh3D.discOnBall(0,0,.185f,.225f,.012f,64);
+        eyeWhite=Mesh3D.discOnBall(0,0,.150f,.188f,.018f,64);
+        mouthBlack=Mesh3D.discOnBall(0,0,.085f,.030f,.012f,52);
     }
     @Override public void onSurfaceChanged(GL10 gl,int width,int height){
         this.width=Math.max(1,width);this.height=Math.max(1,height);
@@ -91,7 +92,6 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT|GLES20.GL_DEPTH_BUFFER_BIT);
         GLES20.glUseProgram(program);
         long now=SystemClock.elapsedRealtimeNanos();
-        float dt=lastFrameNanos==0?1f/60f:Math.min(.07f,(now-lastFrameNanos)/1_000_000_000f);
         lastFrameNanos=now;
         Pose target=requested;
         if(SystemClock.uptimeMillis()-target.timeMillis>950)target=Pose.neutral();
@@ -134,21 +134,27 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
     }
     private void drawCountryball(float now){
         // Countryball rests directly on the desk. No body, neck, shirt, tie, or hair.
-        float x=smooth.x*.20f, y=smooth.y*-.10f;
+        float x=smooth.x*.24f, y=smooth.y*-.14f;
         Matrix.setIdentityM(model,0);
         Matrix.translateM(model,0,x,3.18f+y,-7.08f);
-        Matrix.rotateM(model,0,(mirror?-1:1)*smooth.roll*23f,0,0,1);
-        Matrix.rotateM(model,0,smooth.pitch*-25f,1,0,0);
-        Matrix.rotateM(model,0,(mirror?-1:1)*smooth.yaw*39f,0,1,0);
+        Matrix.rotateM(model,0,(mirror?-1:1)*smooth.roll*26f,0,0,1);
+        Matrix.rotateM(model,0,smooth.pitch*-29f,1,0,0);
+        Matrix.rotateM(model,0,(mirror?-1:1)*smooth.yaw*44f,0,1,0);
         float[] headMat=model.clone();
         draw(head,headMat,new float[]{1,1,1,1},"flag_kefiristan");
-        eye(headMat,-.30f,.14f,Math.max(.02f,smooth.eyeLeft));
-        eye(headMat,.30f,.14f,Math.max(.02f,smooth.eyeRight));
+        // Single flat front surface prevents the diagonal white flag stripe
+        // from creating a pointed animal muzzle between the eyes.
+        float[] facial=headMat.clone();
+        float faceY=-.02f;
+        Matrix.translateM(facial,0,0,faceY,(float)Math.sqrt(1f-faceY*faceY));
+        draw(faceMask,facial,color("#efefef"),null);
+        eye(headMat,-.235f,.11f,Math.max(.02f,smooth.eyeLeft));
+        eye(headMat,.235f,.11f,Math.max(.02f,smooth.eyeRight));
         float opening=Pose.clamp(Math.max(smooth.mouth,audioEnabled?micLevel:0),0,1);
-        float mouthY=-.46f;
+        float mouthY=-.26f;
         float[] mouthMatrix=headMat.clone();
         Matrix.translateM(mouthMatrix,0,0,mouthY,(float)Math.sqrt(1-mouthY*mouthY));
-        scaleAndDraw(mouthBlack,mouthMatrix,1f,.28f+opening*2.8f,1f,color("#0a090b"));
+        scaleAndDraw(mouthBlack,mouthMatrix,1f,.60f+opening*2.35f,1f,color("#080808"));
     }
     private void eye(float[] headMat,float x,float y,float openness){
         float z=(float)Math.sqrt(1-x*x-y*y);
