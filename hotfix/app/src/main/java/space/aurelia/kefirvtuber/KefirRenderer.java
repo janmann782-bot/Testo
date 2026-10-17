@@ -23,8 +23,8 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
     private final Context context;
     private final SnapshotListener listener;
     private OfficeModel office;
-    private Mesh3D head,faceMask,eyeOutline,eyeWhite,mouthBlack,cube;
-    private int program,attributePosition,attributeNormal,attributeUv,uniformMvp,uniformModel,uniformColor,uniformTexture,uniformSampler,uniformShadow;
+    private Mesh3D head,leftOutline,leftWhite,rightOutline,rightWhite,mouthBlack,cube;
+    private int program,attributePosition,attributeNormal,attributeUv,uniformMvp,uniformModel,uniformColor,uniformTexture,uniformSampler,uniformShadow,uniformFacePaint;
     private final float[] proj=new float[16],view=new float[16],vp=new float[16],base=new float[16];
     private final float[] model=new float[16],tmp=new float[16],mvp=new float[16];
     private final Map<String,Integer> textures=new HashMap<>();
@@ -55,6 +55,7 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
         uniformColor=GLES20.glGetUniformLocation(program,"uColor");
         uniformTexture=GLES20.glGetUniformLocation(program,"uTextured");
         uniformShadow=GLES20.glGetUniformLocation(program,"uShadow");
+        uniformFacePaint=GLES20.glGetUniformLocation(program,"uFacePaint");
         uniformSampler=GLES20.glGetUniformLocation(program,"uSampler");
         GLES20.glUseProgram(program);
         GLES20.glEnableVertexAttribArray(attributePosition);
@@ -66,11 +67,12 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
         }
         try{office=new OfficeModel(context.getAssets());}catch(Exception e){android.util.Log.e("KefirVTuber","3D office OBJ loading failed",e);}
         head=Mesh3D.countryball();cube=Mesh3D.unitCube();
-        // Smooth, nearly flush painted facial region, not a protruding mesh nose.
-        faceMask=Mesh3D.discOnBall(0,0,.54f,.50f,.004f,96);
-        eyeOutline=Mesh3D.discOnBall(0,0,.185f,.225f,.012f,64);
-        eyeWhite=Mesh3D.discOnBall(0,0,.150f,.188f,.018f,64);
-        mouthBlack=Mesh3D.discOnBall(0,0,.085f,.030f,.012f,52);
+        // The eye and mouth disks are ALREADY curved onto the head by Mesh3D.
+        leftOutline=Mesh3D.discOnBall(-.30f,.13f,.210f,.245f,.016f,64);
+        rightOutline=Mesh3D.discOnBall(.30f,.13f,.210f,.245f,.016f,64);
+        leftWhite=Mesh3D.discOnBall(-.30f,.13f,.165f,.196f,.026f,64);
+        rightWhite=Mesh3D.discOnBall(.30f,.13f,.165f,.196f,.026f,64);
+        mouthBlack=Mesh3D.discOnBall(0f,-.35f,.19f,.058f,.020f,64);
     }
     @Override public void onSurfaceChanged(GL10 gl,int width,int height){
         this.width=Math.max(1,width);this.height=Math.max(1,height);
@@ -92,11 +94,16 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT|GLES20.GL_DEPTH_BUFFER_BIT);
         GLES20.glUseProgram(program);
         long now=SystemClock.elapsedRealtimeNanos();
+        float dt=lastFrameNanos==0?.0167f:Math.min(.05f,Math.max(.004f,(now-lastFrameNanos)/1_000_000_000f));
         lastFrameNanos=now;
         Pose target=requested;
-        if(SystemClock.uptimeMillis()-target.timeMillis>950)target=Pose.neutral();
-        // Direct per-render-frame pose: no deliberate smoothing or trailing behind head.
-        smooth=target;
+        if(SystemClock.uptimeMillis()-target.timeMillis>1700)target=Pose.neutral();
+        // Adaptive filtering suppresses jitter, fast movement remains near-immediate.
+        float change=Math.max(Math.abs(target.yaw-smooth.yaw),
+                    Math.max(Math.abs(target.pitch-smooth.pitch),Math.abs(target.roll-smooth.roll)));
+        float rate=30f+220f*Math.min(1f,change);
+        float alpha=1f-(float)Math.exp(-rate*dt);
+        smooth=interpolate(smooth,target,alpha);
         drawOffice();
         drawCountryball(now*.000000001f);
         if(snap){snap=false;captureFrame();}
@@ -141,27 +148,24 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
         Matrix.rotateM(model,0,smooth.pitch*-29f,1,0,0);
         Matrix.rotateM(model,0,(mirror?-1:1)*smooth.yaw*44f,0,1,0);
         float[] headMat=model.clone();
+        // Face crossover hidden directly in textured head fragment shader.
         draw(head,headMat,new float[]{1,1,1,1},"flag_kefiristan");
-        // Single flat front surface prevents the diagonal white flag stripe
-        // from creating a pointed animal muzzle between the eyes.
-        float[] facial=headMat.clone();
-        float faceY=-.02f;
-        Matrix.translateM(facial,0,0,faceY,(float)Math.sqrt(1f-faceY*faceY));
-        draw(faceMask,facial,color("#efefef"),null);
-        eye(headMat,-.235f,.11f,Math.max(.02f,smooth.eyeLeft));
-        eye(headMat,.235f,.11f,Math.max(.02f,smooth.eyeRight));
+        eye(headMat,-.30f,.13f,Math.max(.02f,smooth.eyeLeft),leftOutline,leftWhite);
+        eye(headMat,.30f,.13f,Math.max(.02f,smooth.eyeRight),rightOutline,rightWhite);
         float opening=Pose.clamp(Math.max(smooth.mouth,audioEnabled?micLevel:0),0,1);
-        float mouthY=-.26f;
-        float[] mouthMatrix=headMat.clone();
-        Matrix.translateM(mouthMatrix,0,0,mouthY,(float)Math.sqrt(1-mouthY*mouthY));
-        scaleAndDraw(mouthBlack,mouthMatrix,1f,.60f+opening*2.35f,1f,color("#080808"));
+        float[] mouthMat=headMat.clone();
+        Matrix.translateM(mouthMat,0,0,-.35f,0);
+        Matrix.scaleM(mouthMat,0,1,.72f+opening*3.2f,1);
+        Matrix.translateM(mouthMat,0,0,.35f,0);
+        draw(mouthBlack,mouthMat,new float[]{.025f,.025f,.029f,1f},null);
     }
-    private void eye(float[] headMat,float x,float y,float openness){
-        float z=(float)Math.sqrt(1-x*x-y*y);
-        float[] m=headMat.clone(); Matrix.translateM(m,0,x,y,z);
-        scaleAndDraw(eyeOutline,m,1,openness,1,color("#08090c"));
-        float[] n=headMat.clone();Matrix.translateM(n,0,x,y,z);
-        scaleAndDraw(eyeWhite,n,1,openness,1,color("#f9faf7"));
+    private void eye(float[] headMatrix,float x,float y,float openness,Mesh3D border,Mesh3D inner){
+        float[] mat=headMatrix.clone();
+        Matrix.translateM(mat,0,x,y,0);
+        Matrix.scaleM(mat,0,1,openness,1);
+        Matrix.translateM(mat,0,-x,-y,0);
+        draw(border,mat,new float[]{.016f,.018f,.025f,1f},null);
+        draw(inner,mat,new float[]{.98f,.98f,.97f,1f},null);
     }
     private void cubeAt(float[] parent,float x,float y,float z,float w,float h,float d,float[] col){
         float[] m=parent.clone();Matrix.translateM(m,0,x,y,z);scaleAndDraw(cube,m,w,h,d,col);
@@ -179,6 +183,7 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
         Integer texture=tex==null?null:textures.get(tex);
         GLES20.glUniform1f(uniformTexture,texture==null?0:1);
         GLES20.glUniform1f(uniformShadow,shadow?1f:0f);
+        GLES20.glUniform1f(uniformFacePaint,mesh==head?1f:0f);
         if(texture!=null){GLES20.glActiveTexture(GLES20.GL_TEXTURE0);GLES20.glBindTexture(GLES20.GL_TEXTURE_2D,texture);}
         mesh.draw(attributePosition,attributeNormal,attributeUv);
     }
@@ -274,17 +279,21 @@ final class KefirRenderer implements GLSurfaceView.Renderer {
     // decals use radial falloff in the fragment shader, no bitmap rendering.
     private static final String VERTEX=
         "attribute vec3 aPos; attribute vec3 aNormal; attribute vec2 aUv;"+
-        "uniform mat4 uMvp; uniform mat4 uModel; varying vec2 vUv; varying float vLight;"+
+        "uniform mat4 uMvp; uniform mat4 uModel; varying vec2 vUv; varying float vLight; varying vec3 vLocal;"+
         "void main(){vec3 n=normalize(mat3(uModel)*aNormal);"+
         "vec3 key=normalize(vec3(-0.38,0.83,0.36));"+
         "vLight=0.79+0.21*max(dot(n,key),0.0);"+
-        "vUv=aUv;gl_Position=uMvp*vec4(aPos,1.0);}";
+        "vLocal=aPos;vUv=aUv;gl_Position=uMvp*vec4(aPos,1.0);}";
     private static final String FRAGMENT=
         "precision mediump float;uniform vec4 uColor;uniform float uTextured;"+
-        "uniform float uShadow;uniform sampler2D uSampler;varying vec2 vUv;varying float vLight;"+
+        "uniform float uShadow;uniform float uFacePaint;uniform sampler2D uSampler;varying vec2 vUv;varying float vLight;varying vec3 vLocal;"+
         "void main(){if(uShadow>0.5){vec2 d=(vUv-vec2(.5))*2.0;float r=length(d);"+
         "float a=0.40*(1.0-smoothstep(0.12,1.0,r));"+
         "gl_FragColor=vec4(0.015,0.020,0.027,a);return;}"+
         "vec4 albedo=uColor; if(uTextured>0.5)albedo*=texture2D(uSampler,vUv);"+
+        "if(uFacePaint>0.5 && vLocal.z>0.62){"+
+        "vec2 p=vec2(vLocal.x/.44,(vLocal.y+.03)/.44);"+
+        "float coverage=1.0-smoothstep(.88,1.0,length(p));"+
+        "albedo.rgb=mix(albedo.rgb,vec3(.929),coverage);}"+
         "gl_FragColor=vec4(albedo.rgb*vLight,albedo.a);}";
 }

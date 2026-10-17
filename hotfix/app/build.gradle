@@ -6,8 +6,8 @@ android {
         applicationId 'space.aurelia.kefirvtuber'
         minSdk 29
         targetSdk 35
-        versionCode 23
-        versionName '2.3-face-redesign'
+        versionCode 24
+        versionName '2.4-surface-filter'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
